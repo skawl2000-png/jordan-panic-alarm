@@ -16,6 +16,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.core.content.ContextCompat
 import com.jiwan.jordanpanic.ui.theme.JordanPanicAlarmTheme
+import com.google.firebase.messaging.FirebaseMessaging
 
 class MainActivity : ComponentActivity() {
 
@@ -38,7 +39,9 @@ class MainActivity : ComponentActivity() {
             ) {
                 requestPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
-        }
+        }        // FCM 토픽 구독
+        com.google.firebase.messaging.FirebaseMessaging.getInstance()
+            .subscribeToTopic("jordan_panic")
 
         setContent {
             JordanPanicAlarmTheme {
