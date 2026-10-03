@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "990111424072",
+    "project_id": "jordan-panic-alarm",
+    "storage_bucket": "jordan-panic-alarm.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:990111424072:android:d50c82e0a90810787d427d",
+        "android_client_info": {
+          "package_name": "com.jiwan.jordanpanic"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD2CKjVCe588sXiirT9G6jWixmpQxJGzfE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
