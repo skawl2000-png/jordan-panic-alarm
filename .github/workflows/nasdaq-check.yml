@@ -2,8 +2,8 @@ name: 나스닥 공황 감시
 
 on:
   schedule:
-    - cron: '0 15 * * *'  # 매일 한국시간 자정 (UTC 15시)
-  workflow_dispatch:  # 수동 실행 버튼
+    - cron: '0 15 * * *'
+  workflow_dispatch:
 
 jobs:
   check-nasdaq:
@@ -14,12 +14,19 @@ jobs:
         with:
           node-version: '18'
 
+      - name: firebase-admin 설치
+        run: npm install firebase-admin
+
       - name: 나스닥 공황 체크 및 알림 발송
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
         run: |
           node -e "
           const https = require('https');
+          const admin = require('firebase-admin');
+
+          const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+          admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
           function getNasdaq() {
             return new Promise((resolve) => {
@@ -48,12 +55,8 @@ jobs:
             });
           }
 
-          getNasdaq().then(count => {
+          getNasdaq().then(async count => {
             if (count >= 4) {
-              console.log('🚨 공황 신호! FCM 알림 발송 필요:', count + '회');
-              process.exit(0);
-            } else {
-              console.log('✅ 정상. 현재 ' + count + '회');
-            }
-          });
-          "
+              const message = {
+                notification: {
+                  title: '🚨 조던 공황 신호 감지!',
