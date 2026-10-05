@@ -28,11 +28,11 @@ jobs:
           const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
           admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
-          function getNasdaq() {
+          function getStock(symbol) {
             return new Promise((resolve) => {
               const options = {
                 hostname: 'query1.finance.yahoo.com',
-                path: '/v8/finance/chart/%5EIXIC?interval=1d&range=1mo',
+                path: '/v8/finance/chart/' + symbol + '?interval=1d&range=3mo',
                 headers: { 'User-Agent': 'Mozilla/5.0' }
               };
               https.get(options, (res) => {
@@ -41,22 +41,64 @@ jobs:
                 res.on('end', () => {
                   try {
                     const json = JSON.parse(data);
-                    const closes = json.chart.result[0].indicators.quote[0].close;
-                    let count = 0;
-                    for (let i = 1; i < closes.length; i++) {
-                      const change = ((closes[i] - closes[i-1]) / closes[i-1]) * 100;
-                      if (change <= -3) count++;
-                    }
-                    console.log('이번달 -3% 이상 횟수:', count);
-                    resolve(count);
-                  } catch(e) { resolve(0); }
+                    const result = json.chart.result[0];
+                    const closes = result.indicators.quote[0].close;
+                    const price = closes[closes.length - 1];
+                    const prevPrice = closes[closes.length - 2];
+                    const change = ((price - prevPrice) / prevPrice * 100).toFixed(2);
+                    const ma60 = closes.slice(-60).reduce((a,b) => a+b, 0) / Math.min(closes.length, 60);
+                    resolve({ price: price.toFixed(2), change, ma60: ma60.toFixed(2), closes });
+                  } catch(e) { resolve(null); }
                 });
-              }).on('error', () => resolve(0));
+              }).on('error', () => resolve(null));
             });
           }
 
-          getNasdaq().then(async count => {
-            if (count >= 4) {
-              const message = {
-                notification: {
-                  title: '🚨 조던 공황 신호 감지!',
+          async function main() {
+            const nasdaq = await getStock('%5EIXIC');
+            const nvda = await getStock('NVDA');
+            const aapl = await getStock('AAPL');
+
+            // 공황 카운트
+            let panicCount = 0;
+            if (nasdaq) {
+              const closes = nasdaq.closes;
+              for (let i = 1; i < closes.length; i++) {
+                const change = ((closes[i] - closes[i-1]) / closes[i-1]) * 100;
+                if (change <= -3) panicCount++;
+              }
+            }
+
+            // 60일선 신호
+            let nvdaSignal = '';
+            if (nvda) {
+              nvdaSignal = parseFloat(nvda.price) > parseFloat(nvda.ma60)
+                ? '매수 신호 (60일선 위)'
+                : '매수 중단 (60일선 아래)';
+            }
+
+            // 재진입 신호
+            let reentrySignal = panicCount === 0 ? '재진입 가능' : '대기 중';
+
+            // 알림 메시지 작성
+            const title = panicCount >= 4 ? '🚨 공황 신호 감지!' : '✅ 오늘 시장 현황';
+            const body = [
+              '📊 나스닥: ' + (nasdaq ? nasdaq.change + '%' : '정보없음'),
+              '🏆 시총1위(NVDA): $' + (nvda ? nvda.price + ' (' + nvda.change + '%)' : '정보없음'),
+              '🥈 시총2위(AAPL): $' + (aapl ? aapl.price + ' (' + aapl.change + '%)' : '정보없음'),
+              '📈 NVDA 60일선: ' + nvdaSignal,
+              '⚠️ 이달 공황 횟수: ' + panicCount + '회',
+              '🔄 재진입 신호: ' + reentrySignal
+            ].join('\n');
+
+            const message = {
+              notification: { title, body },
+              topic: 'jordan_panic'
+            };
+
+            await admin.messaging().send(message);
+            console.log('알림 발송 완료!');
+          }
+
+          main();
+          "
