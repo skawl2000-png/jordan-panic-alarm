@@ -9,54 +9,18 @@ jobs:
   check-nasdaq:
     runs-on: ubuntu-latest
     steps:
-      - name: Node.js 설정
-        uses: actions/setup-node@v3
-        with:
-          node-version: '18'
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
 
-      - name: firebase-admin 설치
-        run: npm install firebase-admin
+      - name: Node.js 설정
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 패키지 설치
+        run: npm install firebase-admin node-fetch@2
 
       - name: 나스닥 공황 체크 및 알림 발송
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
-        run: |
-          node -e "
-          const https = require('https');
-          const admin = require('firebase-admin');
-
-          const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-          admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-
-          function getNasdaq() {
-            return new Promise((resolve) => {
-              const options = {
-                hostname: 'query1.finance.yahoo.com',
-                path: '/v8/finance/chart/%5EIXIC?interval=1d&range=1mo',
-                headers: { 'User-Agent': 'Mozilla/5.0' }
-              };
-              https.get(options, (res) => {
-                let data = '';
-                res.on('data', chunk => data += chunk);
-                res.on('end', () => {
-                  try {
-                    const json = JSON.parse(data);
-                    const closes = json.chart.result[0].indicators.quote[0].close;
-                    let count = 0;
-                    for (let i = 1; i < closes.length; i++) {
-                      const change = ((closes[i] - closes[i-1]) / closes[i-1]) * 100;
-                      if (change <= -3) count++;
-                    }
-                    console.log('이번달 -3% 이상 횟수:', count);
-                    resolve(count);
-                  } catch(e) { resolve(0); }
-                });
-              }).on('error', () => resolve(0));
-            });
-          }
-
-          getNasdaq().then(async count => {
-            if (count >= 4) {
-              const message = {
-                notification: {
-                  title: '🚨 조던 공황 신호 감지!',
+        run: node run.js
