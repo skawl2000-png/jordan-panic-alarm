@@ -6,7 +6,17 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 const db = admin.firestore();
 
-const DEFAULT_CANDIDATES = ['NVDA', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'AVGO', 'TSLA'];
+// 종목코드: 발행주식수(억주) — 2026년 기준
+const DEFAULT_CANDIDATES = {
+  NVDA: 243.0,
+  AAPL: 148.0,
+  MSFT: 74.3,
+  GOOGL: 121.0,
+  AMZN: 106.0,
+  META: 25.2,
+  AVGO: 47.0,
+  TSLA: 32.2
+};
 
 async function getStock(symbol) {
   try {
@@ -19,8 +29,7 @@ async function getStock(symbol) {
     const prevPrice = closes[closes.length - 2];
     const change = ((price - prevPrice) / prevPrice * 100).toFixed(2);
     const ma60 = (closes.slice(-60).reduce((a,b) => a+b, 0) / Math.min(closes.length, 60)).toFixed(2);
-    const marketCap = result.meta.regularMarketPrice * (result.meta.sharesOutstanding || 0);
-    return { symbol, price: price.toFixed(2), change, ma60, closes, marketCap };
+    return { symbol, price: price.toFixed(2), rawPrice: price, change, ma60, closes };
   } catch(e) {
     console.log('오류:', symbol, e.message);
     return null;
@@ -44,35 +53,37 @@ async function main() {
     console.log('13F 알림 발송!');
   }
 
-  // Firestore에서 후보 종목 리스트 읽기
+  // Firestore에서 후보 종목 읽기
   let candidates = DEFAULT_CANDIDATES;
   try {
-    const settingsDoc = await db.collection('settings').doc('candidates').get();
-    if (settingsDoc.exists && settingsDoc.data().list) {
-      candidates = settingsDoc.data().list;
+    const doc = await db.collection('settings').doc('candidates').get();
+    if (doc.exists && doc.data().stocks) {
+      candidates = doc.data().stocks;
     } else {
-      await db.collection('settings').doc('candidates').set({ list: DEFAULT_CANDIDATES });
+      await db.collection('settings').doc('candidates').set({ stocks: DEFAULT_CANDIDATES });
     }
   } catch(e) {
     console.log('설정 읽기 오류, 기본값 사용');
   }
 
-  console.log('후보 종목:', candidates.join(', '));
+  console.log('후보 종목:', Object.keys(candidates).join(', '));
 
-  // 모든 후보 종목 데이터 수집
+  // 모든 후보 종목 데이터 수집 + 시총 계산
   const stocks = [];
-  for (const sym of candidates) {
+  for (const sym of Object.keys(candidates)) {
     const data = await getStock(sym);
-    if (data && data.marketCap > 0) stocks.push(data);
+    if (data) {
+      data.shares = candidates[sym];
+      data.marketCap = data.rawPrice * candidates[sym];
+      stocks.push(data);
+    }
   }
 
-  // 시총 순으로 정렬
   stocks.sort((a, b) => b.marketCap - a.marketCap);
 
   const first = stocks[0];
   const second = stocks[1];
 
-  // 나스닥 데이터
   const nasdaq = await getStock('%5EIXIC');
 
   let panicCount = 0;
@@ -83,7 +94,6 @@ async function main() {
     }
   }
 
-  // 시총 차이 계산
   let marketCapDiff = '계산 불가';
   let jordanRatio = '확인 불가';
   if (first && second) {
@@ -94,7 +104,6 @@ async function main() {
       : first.symbol + ' 100%';
   }
 
-  // 1위 종목 60일선 신호
   const firstSignal = first
     ? (parseFloat(first.price) > parseFloat(first.ma60) ? '매수 신호 (60일선 위)' : '매수 중단 (60일선 아래)')
     : '정보없음';
@@ -102,7 +111,6 @@ async function main() {
   const isPanic = panicCount >= 4;
   const reentrySignal = panicCount === 0 ? '재진입 가능' : '대기 중';
 
-  // Firestore 저장
   await db.collection('market').doc('latest').set({
     nasdaqChange: nasdaq ? nasdaq.change : '오류',
     firstSymbol: first ? first.symbol : '오류',
