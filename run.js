@@ -4,6 +4,8 @@ const admin = require('firebase-admin');
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
+const db = admin.firestore();
+
 async function getStock(symbol) {
   try {
     const url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + symbol + '?interval=1d&range=3mo';
@@ -40,8 +42,25 @@ async function main() {
     : '정보없음';
 
   const reentrySignal = panicCount === 0 ? '재진입 가능' : '대기 중';
+  const isPanic = panicCount >= 4;
 
-  const title = panicCount >= 4 ? '🚨 공황 신호 감지!' : '✅ 오늘 시장 현황';
+  // Firestore에 데이터 저장
+  await db.collection('market').doc('latest').set({
+    nasdaqChange: nasdaq ? nasdaq.change : '오류',
+    nvdaPrice: nvda ? nvda.price : '오류',
+    nvdaChange: nvda ? nvda.change : '오류',
+    nvdaSignal,
+    aaplPrice: aapl ? aapl.price : '오류',
+    aaplChange: aapl ? aapl.change : '오류',
+    panicCount,
+    reentrySignal,
+    isPanic,
+    updatedAt: new Date().toISOString()
+  });
+
+  console.log('Firestore 저장 완료!');
+
+  const title = isPanic ? '🚨 공황 신호 감지!' : '✅ 오늘 시장 현황';
   const body = [
     '📊 나스닥: ' + (nasdaq ? nasdaq.change + '%' : '정보없음'),
     '🏆 NVDA: $' + (nvda ? nvda.price + ' (' + nvda.change + '%)' : '정보없음'),
@@ -50,9 +69,6 @@ async function main() {
     '⚠️ 이달 공황 횟수: ' + panicCount + '회',
     '🔄 재진입 신호: ' + reentrySignal
   ].join('\n');
-
-  console.log(title);
-  console.log(body);
 
   await admin.messaging().send({
     notification: { title, body },
