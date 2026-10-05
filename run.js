@@ -17,7 +17,8 @@ async function getStock(symbol) {
     const prevPrice = closes[closes.length - 2];
     const change = ((price - prevPrice) / prevPrice * 100).toFixed(2);
     const ma60 = (closes.slice(-60).reduce((a,b) => a+b, 0) / Math.min(closes.length, 60)).toFixed(2);
-    return { price: price.toFixed(2), change, ma60, closes };
+    const marketCap = result.meta.regularMarketPrice * result.meta.sharesOutstanding;
+    return { price: price.toFixed(2), change, ma60, closes, marketCap };
   } catch(e) {
     console.log('오류:', symbol, e.message);
     return null;
@@ -25,10 +26,29 @@ async function getStock(symbol) {
 }
 
 async function main() {
+  const today = new Date();
+  const month = today.getMonth() + 1;
+  const day = today.getDate();
+
+  // 13F 알림 날짜 체크 (2월, 5월, 8월, 11월 15일)
+  const is13FDay = day === 15 && [2, 5, 8, 11].includes(month);
+
+  if (is13FDay) {
+    await admin.messaging().send({
+      notification: {
+        title: '📋 13F 공개됐어요!',
+        body: 'WhaleWisdom에서 기관 투자자 동향을 확인하세요!\nwhalewisdom.com/stock/nvda'
+      },
+      topic: 'jordan_panic'
+    });
+    console.log('13F 알림 발송 완료!');
+  }
+
   const nasdaq = await getStock('%5EIXIC');
   const nvda = await getStock('NVDA');
   const aapl = await getStock('AAPL');
 
+  // 공황 카운트
   let panicCount = 0;
   if (nasdaq) {
     for (let i = 1; i < nasdaq.closes.length; i++) {
@@ -37,14 +57,24 @@ async function main() {
     }
   }
 
+  // 시총 차이 계산
+  let marketCapDiff = '계산 불가';
+  let jordanRatio = '확인 불가';
+  if (nvda && aapl && nvda.marketCap && aapl.marketCap) {
+    const diff = ((nvda.marketCap - aapl.marketCap) / aapl.marketCap * 100).toFixed(1);
+    marketCapDiff = diff + '%';
+    jordanRatio = Math.abs(parseFloat(diff)) < 10 ? 'NVDA 50% + AAPL 50%' : 'NVDA 100%';
+  }
+
+  // 60일선 신호
   const nvdaSignal = nvda
     ? (parseFloat(nvda.price) > parseFloat(nvda.ma60) ? '매수 신호 (60일선 위)' : '매수 중단 (60일선 아래)')
     : '정보없음';
 
-  const reentrySignal = panicCount === 0 ? '재진입 가능' : '대기 중';
   const isPanic = panicCount >= 4;
+  const reentrySignal = panicCount === 0 ? '재진입 가능' : '대기 중';
 
-  // Firestore에 데이터 저장
+  // Firestore 저장
   await db.collection('market').doc('latest').set({
     nasdaqChange: nasdaq ? nasdaq.change : '오류',
     nvdaPrice: nvda ? nvda.price : '오류',
@@ -52,6 +82,8 @@ async function main() {
     nvdaSignal,
     aaplPrice: aapl ? aapl.price : '오류',
     aaplChange: aapl ? aapl.change : '오류',
+    marketCapDiff,
+    jordanRatio,
     panicCount,
     reentrySignal,
     isPanic,
@@ -60,14 +92,16 @@ async function main() {
 
   console.log('Firestore 저장 완료!');
 
-  const title = isPanic ? '🚨 공황 신호 감지!' : '✅ 오늘 시장 현황';
+  const title = isPanic ? '🚨 공황 신호 감지!' : '✅ 조던 모닝';
   const body = [
-    '📊 나스닥: ' + (nasdaq ? nasdaq.change + '%' : '정보없음'),
-    '🏆 NVDA: $' + (nvda ? nvda.price + ' (' + nvda.change + '%)' : '정보없음'),
-    '🥈 AAPL: $' + (aapl ? aapl.price + ' (' + aapl.change + '%)' : '정보없음'),
+    '📊 나스닥: ' + (nasdaq ? nasdaq.change + '%' : '오류'),
+    '🏆 NVDA: $' + (nvda ? nvda.price + ' (' + nvda.change + '%)' : '오류'),
+    '🥈 AAPL: $' + (aapl ? aapl.price + ' (' + aapl.change + '%)' : '오류'),
+    '📊 시총 차이: ' + marketCapDiff,
+    '⚖️ 조던 비율: ' + jordanRatio,
     '📈 NVDA 60일선: ' + nvdaSignal,
-    '⚠️ 이달 공황 횟수: ' + panicCount + '회',
-    '🔄 재진입 신호: ' + reentrySignal
+    '⚠️ 공황 횟수: ' + panicCount + '회',
+    '🔄 재진입: ' + reentrySignal
   ].join('\n');
 
   await admin.messaging().send({
