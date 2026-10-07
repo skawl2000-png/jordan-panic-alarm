@@ -86,6 +86,12 @@ async function main() {
 
   const nasdaq = await getStock('%5EIXIC');
 
+  // 원/달러 환율
+  let fx = await getStock('KRW=X');
+  if (!fx) fx = await getStock('USDKRW=X');
+  const usdKrw = fx ? fx.price : '';
+  console.log('환율:', usdKrw);
+
   let panicCount = 0;
   if (nasdaq) {
     for (let i = 1; i < nasdaq.closes.length; i++) {
@@ -125,6 +131,7 @@ async function main() {
     panicCount,
     reentrySignal,
     isPanic,
+    usdKrw,
     updatedAt: new Date().toISOString()
   });
 
@@ -139,7 +146,8 @@ async function main() {
     '⚖️ 조던 비율: ' + jordanRatio,
     '📈 60일선: ' + firstSignal,
     '⚠️ 공황 횟수: ' + panicCount + '회',
-    '🔄 재진입: ' + reentrySignal
+    '🔄 재진입: ' + reentrySignal,
+    '💱 환율: ' + (usdKrw ? usdKrw + '원' : '조회실패')
   ].join('\n');
 
   await admin.messaging().send({
