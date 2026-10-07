@@ -24,13 +24,23 @@ async function getStock(symbol) {
     const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     const json = await res.json();
     const result = json.chart.result[0];
-    const closes = result.indicators.quote[0].close.filter(v => v !== null);
+    const ts = result.timestamp || [];
+    const raw = result.indicators.quote[0].close;
+
+    // 날짜 + 종가를 짝지어서 보관 (최근 30일 공황 계산에 필요)
+    const series = [];
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] !== null && raw[i] !== undefined) {
+        series.push({ t: ts[i], c: raw[i] });
+      }
+    }
+    const closes = series.map(s => s.c);
     const price = closes[closes.length - 1];
     const prevPrice = closes[closes.length - 2];
     const change = ((price - prevPrice) / prevPrice * 100).toFixed(2);
-    const ma60 = (closes.slice(-60).reduce((a,b) => a+b, 0) / Math.min(closes.length, 60)).toFixed(2);
-    return { symbol, price: price.toFixed(2), rawPrice: price, change, ma60, closes };
-  } catch(e) {
+    const ma60 = (closes.slice(-60).reduce((a, b) => a + b, 0) / Math.min(closes.length, 60)).toFixed(2);
+    return { symbol, price: price.toFixed(2), rawPrice: price, change, ma60, closes, series };
+  } catch (e) {
     console.log('오류:', symbol, e.message);
     return null;
   }
@@ -62,7 +72,7 @@ async function main() {
     } else {
       await db.collection('settings').doc('candidates').set({ stocks: DEFAULT_CANDIDATES });
     }
-  } catch(e) {
+  } catch (e) {
     console.log('설정 읽기 오류, 기본값 사용');
   }
 
@@ -86,12 +96,50 @@ async function main() {
 
   const nasdaq = await getStock('%5EIXIC');
 
-  let panicCount = 0;
-  if (nasdaq) {
-    for (let i = 1; i < nasdaq.closes.length; i++) {
-      const chg = ((nasdaq.closes[i] - nasdaq.closes[i-1]) / nasdaq.closes[i-1]) * 100;
-      if (chg <= -3) panicCount++;
+  // 원/달러 환율
+  let fx = await getStock('KRW=X');
+  if (!fx) fx = await getStock('USDKRW=X');
+  const usdKrw = fx ? fx.price : '';
+  console.log('환율:', usdKrw);
+
+  // ===== 최근 30일 기준 공황 횟수 =====
+  const panicDays = [];
+  if (nasdaq && nasdaq.series.length > 1) {
+    const cutoff = Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60;
+    for (let i = 1; i < nasdaq.series.length; i++) {
+      const cur = nasdaq.series[i];
+      const prev = nasdaq.series[i - 1];
+      if (!cur.t || cur.t < cutoff) continue;
+      const chg = (cur.c - prev.c) / prev.c * 100;
+      if (chg <= -3) {
+        const d = new Date(cur.t * 1000);
+        const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+        const dd = String(d.getUTCDate()).padStart(2, '0');
+        panicDays.push(mm + '/' + dd + ' ' + chg.toFixed(2) + '%');
+      }
     }
+  }
+  const panicCount = panicDays.length;
+  const isPanic = panicCount >= 4;
+  console.log('최근 30일 -3% 횟수:', panicCount, panicDays.join(', '));
+
+  // ===== 단계별 경고 =====
+  let title, panicStage;
+  if (panicCount >= 4) {
+    title = '🚨 공황 신호! 전량 매도';
+    panicStage = '전량 매도 검토하세요!';
+  } else if (panicCount === 3) {
+    title = '⚠️ 위험 3/4 — 매도 준비';
+    panicStage = '한 번만 더 하락하면 공황입니다';
+  } else if (panicCount === 2) {
+    title = '⚠️ 경고 2/4';
+    panicStage = '주의 깊게 지켜보세요';
+  } else if (panicCount === 1) {
+    title = '조던 모닝 (주의 1/4)';
+    panicStage = '-3% 1회 발생';
+  } else {
+    title = '✅ 조던 모닝';
+    panicStage = '정상';
   }
 
   let marketCapDiff = '계산 불가';
@@ -108,7 +156,6 @@ async function main() {
     ? (parseFloat(first.price) > parseFloat(first.ma60) ? '매수 신호 (60일선 위)' : '매수 중단 (60일선 아래)')
     : '정보없음';
 
-  const isPanic = panicCount >= 4;
   const reentrySignal = panicCount === 0 ? '재진입 가능' : '대기 중';
 
   await db.collection('market').doc('latest').set({
@@ -123,27 +170,33 @@ async function main() {
     marketCapDiff,
     jordanRatio,
     panicCount,
+    panicDays,
+    panicStage,
     reentrySignal,
     isPanic,
+    usdKrw,
     updatedAt: new Date().toISOString()
   });
 
   console.log('Firestore 저장 완료!');
 
-  const title = isPanic ? '🚨 공황 신호 감지!' : '✅ 조던 모닝';
-  const body = [
+  const lines = [
     '📊 나스닥: ' + (nasdaq ? nasdaq.change + '%' : '오류'),
     '🏆 1위 ' + (first ? first.symbol + ': $' + first.price + ' (' + first.change + '%)' : '오류'),
     '🥈 2위 ' + (second ? second.symbol + ': $' + second.price + ' (' + second.change + '%)' : '오류'),
     '📊 시총 차이: ' + marketCapDiff,
     '⚖️ 조던 비율: ' + jordanRatio,
     '📈 60일선: ' + firstSignal,
-    '⚠️ 공황 횟수: ' + panicCount + '회',
-    '🔄 재진입: ' + reentrySignal
-  ].join('\n');
+    '💱 환율: ' + (usdKrw ? usdKrw + '원' : '조회실패'),
+    '⚠️ 공황: ' + panicCount + '/4회 (최근 30일) — ' + panicStage
+  ];
+  if (panicDays.length > 0) {
+    lines.push('   ' + panicDays.join(', '));
+  }
+  lines.push('🔄 재진입: ' + reentrySignal);
 
   await admin.messaging().send({
-    notification: { title, body },
+    notification: { title, body: lines.join('\n') },
     topic: 'jordan_panic'
   });
 
