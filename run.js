@@ -133,37 +133,14 @@ async function main() {
   const isPanic = panicCount >= 4;
   console.log('최근 30일 -3% 횟수:', panicCount, panicDays.join(', '));
 
-  // ===== 단계별 경고 =====
-  let title, panicStage;
-  if (panicCount >= 4) {
-    title = '🚨 공황 신호! 전량 매도';
-    panicStage = '전량 매도 검토하세요!';
-  } else if (panicCount === 3) {
-    title = '⚠️ 위험 3/4 — 매도 준비';
-    panicStage = '한 번만 더 하락하면 공황입니다';
-  } else if (panicCount === 2) {
-    title = '⚠️ 경고 2/4';
-    panicStage = '주의 깊게 지켜보세요';
-  } else if (panicCount === 1) {
-    title = '조던 모닝 (주의 1/4)';
-    panicStage = '-3% 1회 발생';
-  } else {
-    title = '✅ 조던 모닝';
-    panicStage = '정상';
-  }
-
-  // 공황이 아닌데 가격 알림이 울렸으면 제목을 그쪽으로
-  if (panicCount < 2 && alertLines.length > 0) {
-    title = '🎯 가격 도달! ' + (alertLines.length > 1 ? alertLines.length + '건' : '');
-  }
-
   // ===== 가격 알림 체크 (내가 지정한 눌림목/돌파 가격) =====
+  // 주의: 아래 '단계별 경고'가 alertLines를 쓰므로 반드시 먼저 와야 함
   let alerts = [];
   try {
     const doc = await db.collection('settings').doc('alerts').get();
     if (doc.exists && Array.isArray(doc.data().list)) alerts = doc.data().list;
   } catch (e) {
-    console.log('알림 설정 읽기 오류');
+    console.log('알림 설정 읽기 오류:', e.message);
   }
 
   const alertLines = [];
@@ -196,10 +173,39 @@ async function main() {
   }
 
   if (alertsChanged) {
-    await db.collection('settings').doc('alerts').set({ list: alerts });
+    // 저장이 실패해도 알림은 가야 하므로 따로 감싼다
+    try {
+      await db.collection('settings').doc('alerts').set({ list: alerts });
+    } catch (e) {
+      console.log('알림 도달표시 저장 실패:', e.message);
+    }
     console.log('가격 알림 도달:', alertLines.length + '건');
   } else {
     console.log('가격 알림 도달 없음 (설정 ' + alerts.length + '건)');
+  }
+
+  // ===== 단계별 경고 =====
+  let title, panicStage;
+  if (panicCount >= 4) {
+    title = '🚨 공황 신호! 전량 매도';
+    panicStage = '전량 매도 검토하세요!';
+  } else if (panicCount === 3) {
+    title = '⚠️ 위험 3/4 — 매도 준비';
+    panicStage = '한 번만 더 하락하면 공황입니다';
+  } else if (panicCount === 2) {
+    title = '⚠️ 경고 2/4';
+    panicStage = '주의 깊게 지켜보세요';
+  } else if (panicCount === 1) {
+    title = '조던 모닝 (주의 1/4)';
+    panicStage = '-3% 1회 발생';
+  } else {
+    title = '✅ 조던 모닝';
+    panicStage = '정상';
+  }
+
+  // 공황이 아닌데 가격 알림이 울렸으면 제목을 그쪽으로
+  if (panicCount < 2 && alertLines.length > 0) {
+    title = '🎯 가격 도달! ' + (alertLines.length > 1 ? alertLines.length + '건' : '');
   }
 
   let marketCapDiff = '계산 불가';
@@ -269,4 +275,9 @@ async function main() {
   console.log('알림 발송 완료!');
 }
 
-main().catch(console.error);
+// 에러가 나면 GitHub Actions에 빨간 X로 표시되도록 종료코드 1로 끝낸다
+// (이게 없으면 코드가 터져도 Success로 보여서 고장을 놓친다)
+main().catch(e => {
+  console.error('실행 실패:', e);
+  process.exit(1);
+});
