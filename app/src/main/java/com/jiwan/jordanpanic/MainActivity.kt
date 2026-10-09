@@ -1,5 +1,6 @@
 package com.jiwan.jordanpanic
 
+import android.app.Activity
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
@@ -41,10 +42,15 @@ class MainActivity : ComponentActivity() {
         FirebaseMessaging.getInstance().subscribeToTopic("jordan_panic")
         val channel = NotificationChannel("jordan_panic_channel", "조던 공황 알림", NotificationManager.IMPORTANCE_HIGH)
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+
+        // 알림을 눌러서 들어온 경우, 알림 내용을 받아둔다
+        val nTitle = intent?.getStringExtra("notiTitle") ?: ""
+        val nBody = intent?.getStringExtra("notiBody") ?: ""
+
         setContent {
             JordanPanicAlarmTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFFF0F4F8)) {
-                    JordanDashboard()
+                    JordanDashboard(nTitle, nBody)
                 }
             }
         }
@@ -247,8 +253,12 @@ fun capWon(eok: Double, rate: Double): String =
 
 // ================= 화면 =================
 @Composable
-fun JordanDashboard() {
+fun JordanDashboard(notiTitle: String = "", notiBody: String = "") {
     val ctx = LocalContext.current
+    val activity = ctx as? Activity
+
+    // 알림 눌러서 들어왔으면 내용을 먼저 보여준다
+    var showNoti by remember { mutableStateOf(notiTitle.isNotEmpty() || notiBody.isNotEmpty()) }
 
     var nasdaqChange by remember { mutableStateOf("...") }
     var firstSymbol by remember { mutableStateOf("...") }
@@ -505,6 +515,46 @@ fun JordanDashboard() {
     val totalRealized = holdings.sumOf { it.realized }
     val totalRealizedWon = holdings.sumOf { it.realizedWon }
     val hasRealized = holdings.any { it.realized != 0.0 }
+
+    // ================= 팝업: 알림 내용 (알림 눌러서 들어왔을 때) =================
+    if (showNoti) {
+        Dialog(onDismissRequest = { showNoti = false }) {
+            Card(shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+                Column(modifier = Modifier.padding(20.dp)) {
+                    Text(
+                        if (notiTitle.isNotEmpty()) notiTitle else "조던 모닝 알림",
+                        fontSize = 19.sp, fontWeight = FontWeight.Bold,
+                        color = if (notiTitle.contains("공황") || notiTitle.contains("위험")) UP_COLOR
+                        else Color(0xFF1A1A1A)
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Column(
+                        modifier = Modifier
+                            .heightIn(max = 400.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        Text(notiBody, fontSize = 14.sp, lineHeight = 21.sp)
+                    }
+                    Spacer(Modifier.height(16.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { showNoti = false },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF5C6BC0))
+                        ) { Text("대시보드 보기", fontSize = 13.sp) }
+                        Button(
+                            onClick = {
+                                showNoti = false
+                                activity?.finish()
+                            },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF757575))
+                        ) { Text("닫기", fontSize = 13.sp) }
+                    }
+                }
+            }
+        }
+    }
 
     // ================= 팝업: 투자룰 =================
     if (showRules) {

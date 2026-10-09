@@ -267,8 +267,13 @@ async function main() {
   }
   lines.push('🔄 재진입: ' + reentrySignal);
 
+  const bodyText = lines.join('\n');
+
   await admin.messaging().send({
-    notification: { title, body: lines.join('\n') },
+    notification: { title, body: bodyText },
+    // data로도 같이 보내야 알림을 눌렀을 때 앱이 내용을 받아서 팝업으로 보여줄 수 있다
+    data: { notiTitle: title, notiBody: bodyText },
+    android: { priority: 'high' },
     topic: 'jordan_panic'
   });
 

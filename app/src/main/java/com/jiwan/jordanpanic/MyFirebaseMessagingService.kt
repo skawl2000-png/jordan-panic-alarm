@@ -12,8 +12,13 @@ import com.google.firebase.messaging.RemoteMessage
 class MyFirebaseMessagingService : FirebaseMessagingService() {
 
     override fun onMessageReceived(remoteMessage: RemoteMessage) {
-        val title = remoteMessage.notification?.title ?: "조던 공황 알림"
-        val body = remoteMessage.notification?.body ?: "나스닥 공황 신호 감지!"
+        // data로 온 걸 우선 쓰고, 없으면 notification 쪽을 쓴다
+        val title = remoteMessage.data["notiTitle"]
+            ?: remoteMessage.notification?.title
+            ?: "조던 공황 알림"
+        val body = remoteMessage.data["notiBody"]
+            ?: remoteMessage.notification?.body
+            ?: "나스닥 공황 신호 감지!"
         sendNotification(title, body)
     }
 
@@ -28,9 +33,11 @@ class MyFirebaseMessagingService : FirebaseMessagingService() {
         )
         notificationManager.createNotificationChannel(channel)
 
-        // 알림 누르면 앱 열기
+        // 알림 누르면 앱이 열리면서, 알림 내용을 같이 넘겨준다
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("notiTitle", title)
+            putExtra("notiBody", body)
         }
         val pendingIntent = PendingIntent.getActivity(
             this, 0, intent,
