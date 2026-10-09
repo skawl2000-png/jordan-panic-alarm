@@ -25,13 +25,16 @@ async function getStock(symbol) {
     const json = await res.json();
     const result = json.chart.result[0];
     const ts = result.timestamp || [];
-    const raw = result.indicators.quote[0].close;
+    const q = result.indicators.quote[0];
+    const raw = q.close;
 
     // 날짜 + 종가를 짝지어서 보관 (최근 30일 공황 계산에 필요)
     const series = [];
+    let lastIdx = -1;
     for (let i = 0; i < raw.length; i++) {
       if (raw[i] !== null && raw[i] !== undefined) {
         series.push({ t: ts[i], c: raw[i] });
+        lastIdx = i;
       }
     }
     const closes = series.map(s => s.c);
@@ -39,7 +42,14 @@ async function getStock(symbol) {
     const prevPrice = closes[closes.length - 2];
     const change = ((price - prevPrice) / prevPrice * 100).toFixed(2);
     const ma60 = (closes.slice(-60).reduce((a, b) => a + b, 0) / Math.min(closes.length, 60)).toFixed(2);
-    return { symbol, price: price.toFixed(2), rawPrice: price, change, ma60, closes, series };
+
+    // 마지막 거래일의 저가/고가 (가격 알림 체크용)
+    const lowArr = q.low || [];
+    const highArr = q.high || [];
+    const lastLow = (lastIdx >= 0 && lowArr[lastIdx] != null) ? lowArr[lastIdx] : price;
+    const lastHigh = (lastIdx >= 0 && highArr[lastIdx] != null) ? highArr[lastIdx] : price;
+
+    return { symbol, price: price.toFixed(2), rawPrice: price, change, ma60, closes, series, lastLow, lastHigh };
   } catch (e) {
     console.log('오류:', symbol, e.message);
     return null;
@@ -142,6 +152,56 @@ async function main() {
     panicStage = '정상';
   }
 
+  // 공황이 아닌데 가격 알림이 울렸으면 제목을 그쪽으로
+  if (panicCount < 2 && alertLines.length > 0) {
+    title = '🎯 가격 도달! ' + (alertLines.length > 1 ? alertLines.length + '건' : '');
+  }
+
+  // ===== 가격 알림 체크 (내가 지정한 눌림목/돌파 가격) =====
+  let alerts = [];
+  try {
+    const doc = await db.collection('settings').doc('alerts').get();
+    if (doc.exists && Array.isArray(doc.data().list)) alerts = doc.data().list;
+  } catch (e) {
+    console.log('알림 설정 읽기 오류');
+  }
+
+  const alertLines = [];
+  let alertsChanged = false;
+  const todayStr = today.toISOString().slice(0, 10);
+
+  for (const a of alerts) {
+    if (a.hit) continue;                      // 이미 울린 건 건너뜀
+    const target = parseFloat(a.price);
+    if (!isFinite(target) || target <= 0) continue;
+
+    // 이미 받아온 종목이면 재사용, 아니면 따로 조회
+    let s = stocks.find(x => x.symbol === a.symbol);
+    if (!s) s = await getStock(a.symbol);
+    if (!s) continue;
+
+    // 종가가 아니라 장중 저가/고가로 판단 (밤에 스쳐도 잡히게)
+    const reached = (a.dir === 'above') ? (s.lastHigh >= target) : (s.lastLow <= target);
+    if (reached) {
+      a.hit = true;
+      a.hitDate = todayStr;
+      alertsChanged = true;
+      alertLines.push(
+        (a.dir === 'above' ? '📈 돌파! ' : '📉 눌림목! ') +
+        a.symbol + ' $' + target.toFixed(2) + (a.dir === 'above' ? ' 이상' : ' 이하') +
+        ' (저가 $' + s.lastLow.toFixed(2) + ' / 고가 $' + s.lastHigh.toFixed(2) + ')' +
+        (a.note ? ' — ' + a.note : '')
+      );
+    }
+  }
+
+  if (alertsChanged) {
+    await db.collection('settings').doc('alerts').set({ list: alerts });
+    console.log('가격 알림 도달:', alertLines.length + '건');
+  } else {
+    console.log('가격 알림 도달 없음 (설정 ' + alerts.length + '건)');
+  }
+
   let marketCapDiff = '계산 불가';
   let jordanRatio = '확인 불가';
   if (first && second) {
@@ -180,7 +240,13 @@ async function main() {
 
   console.log('Firestore 저장 완료!');
 
-  const lines = [
+  const lines = [];
+
+  // 가격 알림은 제일 위에 (제일 급한 정보)
+  for (const line of alertLines) lines.push(line);
+  if (alertLines.length > 0) lines.push('');
+
+  lines.push(
     '📊 나스닥: ' + (nasdaq ? nasdaq.change + '%' : '오류'),
     '🏆 1위 ' + (first ? first.symbol + ': $' + first.price + ' (' + first.change + '%)' : '오류'),
     '🥈 2위 ' + (second ? second.symbol + ': $' + second.price + ' (' + second.change + '%)' : '오류'),
@@ -189,7 +255,7 @@ async function main() {
     '📈 60일선: ' + firstSignal,
     '💱 환율: ' + (usdKrw ? usdKrw + '원' : '조회실패'),
     '⚠️ 공황: ' + panicCount + '/4회 (최근 30일) — ' + panicStage
-  ];
+  );
   if (panicDays.length > 0) {
     lines.push('   ' + panicDays.join(', '));
   }

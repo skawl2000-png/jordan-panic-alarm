@@ -52,8 +52,9 @@ class MainActivity : ComponentActivity() {
 }
 
 // ================= 매수 기록 (폰에 저장) =================
-// rate = 매수 당시 원/달러 환율 (환차익 계산용)
-data class Buy(
+// type = "BUY" 또는 "SELL", rate = 거래 당시 원/달러 환율
+data class Trade(
+    val type: String,
     val symbol: String,
     val shares: Double,
     val price: Double,
@@ -68,19 +69,50 @@ data class Holding(
     val cost: Double,
     val costWon: Double,
     val cur: Double,
-    val ok: Boolean
+    val ok: Boolean,
+    val realized: Double,
+    val realizedWon: Double
 )
 
 // 한국식 색깔: 오르면 빨강, 내리면 파랑
 val UP_COLOR = Color(0xFFD32F2F)
 val DOWN_COLOR = Color(0xFF1565C0)
 
+// state = 장 상태 (PRE / REGULAR / POST / CLOSED), note = "마감까지 2시간 10분"
+data class Quote(val price: Double, val change: Double, val state: String, val note: String)
+
 data class LiveSnap(
-    val nasdaq: Pair<Double, Double>?,
+    val nasdaq: Quote?,
     val rate: Double,
     val prices: Map<String, Double>,
     val changes: Map<String, Double>
 )
+
+// 가격 알림 (Firestore에 저장 — 클라우드가 읽어야 하므로 폰 저장 아님)
+// dir: "below" = 이하로 내려오면, "above" = 이상으로 올라가면
+data class PriceAlert(
+    val symbol: String,
+    val price: Double,
+    val dir: String,
+    val note: String,
+    val hit: Boolean,
+    val hitDate: String
+)
+
+fun saveAlerts(list: List<PriceAlert>) {
+    val arr = list.map {
+        mapOf(
+            "symbol" to it.symbol,
+            "price" to it.price,
+            "dir" to it.dir,
+            "note" to it.note,
+            "hit" to it.hit,
+            "hitDate" to it.hitDate
+        )
+    }
+    FirebaseFirestore.getInstance().collection("settings").document("alerts")
+        .set(mapOf("list" to arr))
+}
 
 // 시총 순위 한 줄 (cap 단위: 억달러)
 data class CapRow(
@@ -91,15 +123,16 @@ data class CapRow(
     val cap: Double
 )
 
-fun loadBuys(ctx: Context): List<Buy> {
+fun loadTrades(ctx: Context): List<Trade> {
     val raw = ctx.getSharedPreferences("jordan", Context.MODE_PRIVATE).getString("buys", "[]") ?: "[]"
-    val list = mutableListOf<Buy>()
+    val list = mutableListOf<Trade>()
     try {
         val arr = JSONArray(raw)
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
             list.add(
-                Buy(
+                Trade(
+                    o.optString("type", "BUY"),   // 예전 기록엔 type이 없음 -> 매수로 간주
                     o.getString("symbol"),
                     o.getDouble("shares"),
                     o.getDouble("price"),
@@ -113,15 +146,16 @@ fun loadBuys(ctx: Context): List<Buy> {
     return list
 }
 
-fun saveBuys(ctx: Context, buys: List<Buy>) {
+fun saveTrades(ctx: Context, trades: List<Trade>) {
     val arr = JSONArray()
-    for (b in buys) {
+    for (t in trades) {
         val o = JSONObject()
-        o.put("symbol", b.symbol)
-        o.put("shares", b.shares)
-        o.put("price", b.price)
-        o.put("date", b.date)
-        o.put("rate", b.rate)
+        o.put("type", t.type)
+        o.put("symbol", t.symbol)
+        o.put("shares", t.shares)
+        o.put("price", t.price)
+        o.put("date", t.date)
+        o.put("rate", t.rate)
         arr.put(o)
     }
     ctx.getSharedPreferences("jordan", Context.MODE_PRIVATE).edit()
@@ -129,7 +163,7 @@ fun saveBuys(ctx: Context, buys: List<Buy>) {
 }
 
 // ================= 실시간 시세 조회 =================
-fun fetchPrice(symbol: String): Pair<Double, Double>? {
+fun fetchPrice(symbol: String): Quote? {
     return try {
         val enc = symbol.replace("^", "%5E")
         val conn = URL("https://query1.finance.yahoo.com/v8/finance/chart/$enc?interval=1d&range=1mo")
@@ -140,6 +174,36 @@ fun fetchPrice(symbol: String): Pair<Double, Double>? {
         val txt = conn.inputStream.bufferedReader().use { it.readText() }
         conn.disconnect()
         val result = JSONObject(txt).getJSONObject("chart").getJSONArray("result").getJSONObject(0)
+        val meta = result.optJSONObject("meta")
+
+        // 장 상태: marketState가 있으면 쓰고, 없으면 오늘 거래시간으로 직접 계산
+        var state = meta?.optString("marketState", "") ?: ""
+        var note = ""
+        val ctp = meta?.optJSONObject("currentTradingPeriod")
+        if (ctp != null) {
+            val now = System.currentTimeMillis() / 1000L
+            val reg = ctp.optJSONObject("regular")
+            val pre = ctp.optJSONObject("pre")
+            val post = ctp.optJSONObject("post")
+            val rs = reg?.optLong("start") ?: 0L
+            val re = reg?.optLong("end") ?: 0L
+            if (state.isEmpty()) {
+                state = when {
+                    rs > 0L && now >= rs && now < re -> "REGULAR"
+                    pre != null && now >= pre.optLong("start") && now < pre.optLong("end") -> "PRE"
+                    post != null && now >= post.optLong("start") && now < post.optLong("end") -> "POST"
+                    else -> "CLOSED"
+                }
+            }
+            if (rs > 0L) {
+                note = when {
+                    now in rs until re -> "마감까지 " + hhmm(re - now)
+                    now < rs -> "개장까지 " + hhmm(rs - now)
+                    else -> ""
+                }
+            }
+        }
+
         val arr = result.getJSONObject("indicators").getJSONArray("quote")
             .getJSONObject(0).getJSONArray("close")
         val closes = ArrayList<Double>()
@@ -148,10 +212,25 @@ fun fetchPrice(symbol: String): Pair<Double, Double>? {
         val price = closes[closes.size - 1]
         val prev = closes[closes.size - 2]
         val change = if (prev > 0.0) (price - prev) / prev * 100.0 else 0.0
-        Pair(price, change)
+        Quote(price, change, state, note)
     } catch (e: Exception) {
         null
     }
+}
+
+fun hhmm(sec: Long): String {
+    val h = sec / 3600L
+    val m = (sec % 3600L) / 60L
+    return if (h > 0L) "${h}시간 ${m}분" else "${m}분"
+}
+
+// 장 상태 -> 우리말
+fun marketText(s: String): String = when (s.uppercase()) {
+    "REGULAR" -> "장중"
+    "PRE", "PREPRE" -> "프리마켓"
+    "POST", "POSTPOST" -> "애프터마켓"
+    "CLOSED" -> "장 마감"
+    else -> ""
 }
 
 fun won(v: Double): String = String.format(Locale.KOREA, "%,.0f원", v)
@@ -191,20 +270,30 @@ fun JordanDashboard() {
     var showRules by remember { mutableStateOf(false) }
     var showStocks by remember { mutableStateOf(false) }
     var showInvest by remember { mutableStateOf(false) }
+    var showAlerts by remember { mutableStateOf(false) }
+
+    var alerts by remember { mutableStateOf(listOf<PriceAlert>()) }
+    var alertSymbol by remember { mutableStateOf("") }
+    var alertPrice by remember { mutableStateOf("") }
+    var alertNote by remember { mutableStateOf("") }
+    var alertDir by remember { mutableStateOf("below") }
 
     var candidates by remember { mutableStateOf(mapOf<String, Double>()) }
     var newSymbol by remember { mutableStateOf("") }
     var newShares by remember { mutableStateOf("") }
 
-    var buys by remember { mutableStateOf(loadBuys(ctx)) }
+    var trades by remember { mutableStateOf(loadTrades(ctx)) }
     var buySymbol by remember { mutableStateOf("") }
     var buyQty by remember { mutableStateOf("") }
     var buyPrice by remember { mutableStateOf("") }
+    var buyType by remember { mutableStateOf("BUY") }
 
     var usdKrw by remember { mutableStateOf(0.0) }
     var livePrice by remember { mutableStateOf(mapOf<String, Double>()) }
     var liveChange by remember { mutableStateOf(mapOf<String, Double>()) }
     var liveTime by remember { mutableStateOf("") }
+    var marketState by remember { mutableStateOf("") }
+    var marketNote by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(false) }
     var refreshTick by remember { mutableStateOf(0) }
 
@@ -257,6 +346,34 @@ fun JordanDashboard() {
                 }
             }
         }
+        db.collection("settings").document("alerts").get().addOnSuccessListener { doc ->
+            if (doc != null && doc.exists()) {
+                val rawList = doc.get("list") as? List<*>
+                if (rawList != null) {
+                    val l = mutableListOf<PriceAlert>()
+                    for (item in rawList) {
+                        val m = item as? Map<*, *> ?: continue
+                        val sym = m["symbol"] as? String ?: continue
+                        val p = when (val v = m["price"]) {
+                            is Number -> v.toDouble()
+                            is String -> v.toDoubleOrNull() ?: 0.0
+                            else -> 0.0
+                        }
+                        if (p <= 0.0) continue
+                        l.add(
+                            PriceAlert(
+                                sym, p,
+                                (m["dir"] as? String) ?: "below",
+                                (m["note"] as? String) ?: "",
+                                (m["hit"] as? Boolean) ?: false,
+                                (m["hitDate"] as? String) ?: ""
+                            )
+                        )
+                    }
+                    alerts = l
+                }
+            }
+        }
     }
 
     LaunchedEffect(Unit) { loadData() }
@@ -268,7 +385,7 @@ fun JordanDashboard() {
         val syms = mutableSetOf<String>()
         syms.add(firstSymbol)
         if (secondSymbol != "..." && secondSymbol != "오류") syms.add(secondSymbol)
-        for (b in buys) syms.add(b.symbol)
+        for (t in trades) syms.add(t.symbol)
 
         val snap = withContext(Dispatchers.IO) {
             val nas = fetchPrice("^IXIC")
@@ -278,14 +395,18 @@ fun JordanDashboard() {
             for (s in syms) {
                 val q = fetchPrice(s)
                 if (q != null) {
-                    pm[s] = q.first
-                    cm[s] = q.second
+                    pm[s] = q.price
+                    cm[s] = q.change
                 }
             }
-            LiveSnap(nas, fx?.first ?: 0.0, pm, cm)
+            LiveSnap(nas, fx?.price ?: 0.0, pm, cm)
         }
 
-        if (snap.nasdaq != null) nasdaqChange = num(snap.nasdaq.second)
+        if (snap.nasdaq != null) {
+            nasdaqChange = num(snap.nasdaq.change)
+            marketState = snap.nasdaq.state
+            marketNote = snap.nasdaq.note
+        }
         if (snap.rate > 0.0) usdKrw = snap.rate
         if (snap.prices.isNotEmpty()) {
             livePrice = snap.prices
@@ -306,8 +427,8 @@ fun JordanDashboard() {
             for (s in syms) {
                 val q = fetchPrice(s)
                 if (q != null) {
-                    pm[s] = q.first
-                    cm[s] = q.second
+                    pm[s] = q.price
+                    cm[s] = q.change
                 }
             }
             Pair(pm.toMap(), cm.toMap())
@@ -330,14 +451,35 @@ fun JordanDashboard() {
     val sPrice = livePrice[secondSymbol]?.let { num(it) } ?: secondPrice
     val sChange = liveChange[secondSymbol]?.let { num(it) } ?: secondChange
 
-    // ---- 내 투자 계산 ----
-    val holdings = buys.groupBy { it.symbol }.map { entry ->
-        val qty = entry.value.sumOf { it.shares }
-        val cost = entry.value.sumOf { it.shares * it.price }
-        // 매수 당시 환율로 환산한 진짜 원화 원금 (환율 기록이 없는 옛 기록은 현재 환율 사용)
-        val costWon = entry.value.sumOf {
-            it.shares * it.price * (if (it.rate > 0.0) it.rate else usdKrw)
+    // ---- 내 투자 계산 (이동평균법) ----
+    val holdings = trades.groupBy { it.symbol }.map { entry ->
+        var qty = 0.0          // 보유 주수
+        var cost = 0.0         // 남은 원금 (달러)
+        var costWon = 0.0      // 남은 원금 (원, 매수 당시 환율)
+        var realized = 0.0     // 실현 손익 (달러)
+        var realizedWon = 0.0  // 실현 손익 (원)
+
+        // 날짜순으로 하나씩 처리해야 평균단가가 제대로 나옴
+        for (t in entry.value.sortedBy { it.date }) {
+            val rate = if (t.rate > 0.0) t.rate else usdKrw
+            if (t.type == "SELL") {
+                val sellQty = minOf(t.shares, qty)
+                if (qty > 0.0 && sellQty > 0.0) {
+                    val avgUsd = cost / qty
+                    val avgWon = costWon / qty
+                    realized += sellQty * (t.price - avgUsd)
+                    realizedWon += sellQty * t.price * rate - sellQty * avgWon
+                    cost -= sellQty * avgUsd
+                    costWon -= sellQty * avgWon
+                    qty -= sellQty
+                }
+            } else {
+                qty += t.shares
+                cost += t.shares * t.price
+                costWon += t.shares * t.price * rate
+            }
         }
+
         val avg = if (qty > 0.0) cost / qty else 0.0
         val raw = livePrice[entry.key] ?: when (entry.key) {
             firstSymbol -> firstPrice.toDoubleOrNull() ?: 0.0
@@ -346,8 +488,8 @@ fun JordanDashboard() {
         }
         // 시세를 못 받으면 평단으로 대체 → 전체 수익률이 망가지지 않게
         val ok = raw > 0.0
-        Holding(entry.key, qty, avg, cost, costWon, if (ok) raw else avg, ok)
-    }
+        Holding(entry.key, qty, avg, cost, costWon, if (ok) raw else avg, ok, realized, realizedWon)
+    }.filter { it.qty > 0.000001 || it.realized != 0.0 }
     val totalCost = holdings.sumOf { it.cost }
     val totalValue = holdings.sumOf { it.qty * it.cur }
     val profit = totalValue - totalCost
@@ -358,6 +500,11 @@ fun JordanDashboard() {
     val totalValueWon = totalValue * usdKrw
     val profitWon = totalValueWon - totalCostWon
     val profitWonPct = if (totalCostWon > 0.0) profitWon / totalCostWon * 100.0 else 0.0
+
+    // 실현 손익 (매도분)
+    val totalRealized = holdings.sumOf { it.realized }
+    val totalRealizedWon = holdings.sumOf { it.realizedWon }
+    val hasRealized = holdings.any { it.realized != 0.0 }
 
     // ================= 팝업: 투자룰 =================
     if (showRules) {
@@ -471,30 +618,60 @@ fun JordanDashboard() {
         Dialog(onDismissRequest = { showInvest = false }) {
             Card(shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth().padding(16.dp)) {
                 Column(modifier = Modifier.padding(20.dp).verticalScroll(rememberScrollState())) {
-                    Text("내 매수 기록", fontSize = 20.sp, fontWeight = FontWeight.Bold,
+                    Text("내 거래 기록", fontSize = 20.sp, fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(bottom = 10.dp))
-                    if (buys.isEmpty()) {
+                    if (trades.isEmpty()) {
                         Text("아직 기록이 없어요", fontSize = 13.sp, color = Color.Gray)
                     }
-                    for (b in buys) {
+                    for (t in trades.sortedBy { it.date }) {
+                        val isSell = t.type == "SELL"
                         Row(modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically) {
-                            Column {
-                                Text("${b.symbol}  ${num(b.shares)}주 @ ${usd(b.price)}", fontSize = 14.sp)
-                                Text(b.date, fontSize = 11.sp, color = Color.Gray)
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    (if (isSell) "매도  " else "매수  ") +
+                                        "${t.symbol}  ${num(t.shares)}주 @ ${usd(t.price)}",
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (isSell) DOWN_COLOR else UP_COLOR
+                                )
+                                Text(
+                                    t.date + (if (t.rate > 0.0) "   환율 ${won(t.rate)}" else ""),
+                                    fontSize = 11.sp, color = Color.Gray
+                                )
                             }
                             TextButton(onClick = {
-                                val list = buys.toMutableList()
-                                list.remove(b)
-                                buys = list
-                                saveBuys(ctx, list)
+                                val list = trades.toMutableList()
+                                list.remove(t)
+                                trades = list
+                                saveTrades(ctx, list)
                             }) { Text("삭제", color = Color.Red, fontSize = 13.sp) }
                         }
                     }
 
                     Spacer(Modifier.height(14.dp))
-                    Text("매수 추가", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("거래 추가", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(6.dp))
+
+                    // 매수 / 매도 선택
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { buyType = "BUY" },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (buyType == "BUY") UP_COLOR else Color(0xFFBDBDBD)
+                            )
+                        ) { Text("매수") }
+                        Button(
+                            onClick = { buyType = "SELL" },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (buyType == "SELL") DOWN_COLOR else Color(0xFFBDBDBD)
+                            )
+                        ) { Text("매도") }
+                    }
+
                     Spacer(Modifier.height(6.dp))
                     OutlinedTextField(value = buySymbol, onValueChange = { buySymbol = it.uppercase() },
                         label = { Text("종목 (예: NVDA)") }, singleLine = true,
@@ -506,29 +683,154 @@ fun JordanDashboard() {
                         modifier = Modifier.fillMaxWidth())
                     Spacer(Modifier.height(6.dp))
                     OutlinedTextField(value = buyPrice, onValueChange = { buyPrice = it },
-                        label = { Text("매수가 (달러)") }, singleLine = true,
+                        label = { Text(if (buyType == "SELL") "매도가 (달러)" else "매수가 (달러)") },
+                        singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                         modifier = Modifier.fillMaxWidth())
+
+                    // 매도할 때 보유 수량보다 많이 넣으면 알려주기
+                    if (buyType == "SELL" && buySymbol.isNotBlank()) {
+                        val held = holdings.firstOrNull { it.symbol == buySymbol }?.qty ?: 0.0
+                        val want = buyQty.toDoubleOrNull() ?: 0.0
+                        Text(
+                            if (want > held) "보유 ${num(held)}주보다 많아요 — ${num(held)}주까지만 반영됩니다"
+                            else "보유 ${num(held)}주",
+                            fontSize = 11.sp,
+                            color = if (want > held) Color(0xFFE65100) else Color.Gray
+                        )
+                    }
+
                     Spacer(Modifier.height(8.dp))
                     Button(onClick = {
                         val q = buyQty.toDoubleOrNull()
                         val p = buyPrice.toDoubleOrNull()
                         if (buySymbol.isNotBlank() && q != null && q > 0.0 && p != null && p > 0.0) {
                             val today = SimpleDateFormat("yyyy-MM-dd", Locale.KOREA).format(Date())
-                            val list = buys + Buy(buySymbol, q, p, today, usdKrw)
-                            buys = list
-                            saveBuys(ctx, list)
+                            val list = trades + Trade(buyType, buySymbol, q, p, today, usdKrw)
+                            trades = list
+                            saveTrades(ctx, list)
                             buySymbol = ""
                             buyQty = ""
                             buyPrice = ""
                             refreshTick++
                         }
                     }, modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))) {
-                        Text("기록 추가")
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (buyType == "SELL") DOWN_COLOR else UP_COLOR
+                        )) {
+                        Text(if (buyType == "SELL") "매도 기록 추가" else "매수 기록 추가")
                     }
                     Spacer(Modifier.height(8.dp))
                     Button(onClick = { showInvest = false }, modifier = Modifier.fillMaxWidth()) { Text("닫기") }
+                }
+            }
+        }
+    }
+
+    // ================= 팝업: 가격 알림 =================
+    if (showAlerts) {
+        Dialog(onDismissRequest = { showAlerts = false }) {
+            Card(shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+                Column(modifier = Modifier.padding(20.dp).verticalScroll(rememberScrollState())) {
+                    Text("가격 알림", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    Text("지정한 가격에 닿으면 아침 알림에 같이 옵니다", fontSize = 11.sp, color = Color.Gray,
+                        modifier = Modifier.padding(bottom = 10.dp))
+
+                    if (alerts.isEmpty()) {
+                        Text("설정된 알림이 없어요", fontSize = 13.sp, color = Color.Gray)
+                    }
+
+                    for (a in alerts) {
+                        Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "${a.symbol}  ${usd(a.price)} " + (if (a.dir == "above") "이상" else "이하"),
+                                    fontSize = 15.sp,
+                                    fontWeight = if (a.hit) FontWeight.Normal else FontWeight.Bold,
+                                    color = if (a.hit) Color.Gray
+                                    else if (a.dir == "above") UP_COLOR else DOWN_COLOR
+                                )
+                                if (a.note.isNotEmpty()) {
+                                    Text(a.note, fontSize = 12.sp, color = Color.Gray)
+                                }
+                                if (a.hit) {
+                                    Text("도달 ${a.hitDate}", fontSize = 11.sp, color = Color(0xFFE65100))
+                                }
+                            }
+                            TextButton(onClick = {
+                                val l = alerts.filter { it !== a }
+                                alerts = l
+                                saveAlerts(l)
+                            }) { Text("삭제", color = Color.Red, fontSize = 12.sp) }
+                        }
+                        Spacer(Modifier.height(2.dp))
+                    }
+
+                    Spacer(Modifier.height(14.dp))
+                    Text("알림 추가", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(6.dp))
+
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { alertDir = "below" },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (alertDir == "below") DOWN_COLOR else Color(0xFFBDBDBD)
+                            )
+                        ) { Text("이하 (눌림목)", fontSize = 12.sp) }
+                        Button(
+                            onClick = { alertDir = "above" },
+                            modifier = Modifier.weight(1f),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (alertDir == "above") UP_COLOR else Color(0xFFBDBDBD)
+                            )
+                        ) { Text("이상 (돌파)", fontSize = 12.sp) }
+                    }
+
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedTextField(value = alertSymbol, onValueChange = { alertSymbol = it.uppercase() },
+                        label = { Text("종목 (예: NVDA)") }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedTextField(value = alertPrice, onValueChange = { alertPrice = it },
+                        label = { Text("가격 (달러)") }, singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedTextField(value = alertNote, onValueChange = { alertNote = it },
+                        label = { Text("메모 (예: 1차 눌림목)") }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth())
+
+                    // 현재가 대비 안내
+                    val curForAlert = livePrice[alertSymbol] ?: 0.0
+                    val tgt = alertPrice.toDoubleOrNull() ?: 0.0
+                    if (curForAlert > 0.0 && tgt > 0.0) {
+                        val gap = (tgt - curForAlert) / curForAlert * 100.0
+                        Text(
+                            "현재 ${usd(curForAlert)} 에서 ${pct(gap)}",
+                            fontSize = 11.sp, color = Color.Gray
+                        )
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    Button(onClick = {
+                        val p = alertPrice.toDoubleOrNull()
+                        if (alertSymbol.isNotBlank() && p != null && p > 0.0) {
+                            val l = alerts + PriceAlert(alertSymbol, p, alertDir, alertNote, false, "")
+                            alerts = l
+                            saveAlerts(l)
+                            alertPrice = ""
+                            alertNote = ""
+                        }
+                    }, modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (alertDir == "above") UP_COLOR else DOWN_COLOR
+                        )) { Text("알림 추가") }
+
+                    Spacer(Modifier.height(8.dp))
+                    Button(onClick = { showAlerts = false }, modifier = Modifier.fillMaxWidth()) { Text("닫기") }
                 }
             }
         }
@@ -539,8 +841,22 @@ fun JordanDashboard() {
         Text("조던 모닝 대시보드", fontSize = 22.sp, fontWeight = FontWeight.Bold)
         Text(
             if (liveTime.isNotEmpty()) "실시간 $liveTime  (오전집계 $updatedAt)" else "업데이트: $updatedAt",
-            fontSize = 11.sp, color = Color.Gray, modifier = Modifier.padding(bottom = 10.dp)
+            fontSize = 11.sp, color = Color.Gray
         )
+
+        val mText = marketText(marketState)
+        if (mText.isNotEmpty()) {
+            Text(
+                "● 미국장 $mText" + (if (marketNote.isNotEmpty()) "  ($marketNote)" else ""),
+                fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                color = when (marketState.uppercase()) {
+                    "REGULAR" -> Color(0xFF2E7D32)
+                    "PRE", "PREPRE", "POST", "POSTPOST" -> Color(0xFFE65100)
+                    else -> Color.Gray
+                }
+            )
+        }
+        Spacer(Modifier.height(10.dp))
 
         Button(
             onClick = { refreshTick++ },
@@ -551,21 +867,31 @@ fun JordanDashboard() {
             Text(if (loading) "조회중..." else "실시간 조회", fontSize = 15.sp, fontWeight = FontWeight.Bold)
         }
 
-        Row(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Button(onClick = { showRules = true }, modifier = Modifier.weight(1f),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF5C6BC0))) {
-                Text("투자룰", fontSize = 12.sp)
+                Text("투자룰", fontSize = 13.sp)
             }
             Button(onClick = { showStocks = true }, modifier = Modifier.weight(1f),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF26A69A))) {
-                Text("종목관리", fontSize = 12.sp)
+                Text("종목관리", fontSize = 13.sp)
             }
+        }
+        Row(modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Button(onClick = {
                 if (buySymbol.isBlank() && firstSymbol != "..." && firstSymbol != "오류") buySymbol = firstSymbol
                 showInvest = true
             }, modifier = Modifier.weight(1f),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8E24AA))) {
-                Text("내 투자", fontSize = 12.sp)
+                Text("내 투자", fontSize = 13.sp)
+            }
+            Button(onClick = {
+                if (alertSymbol.isBlank() && firstSymbol != "..." && firstSymbol != "오류") alertSymbol = firstSymbol
+                showAlerts = true
+            }, modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF6C00))) {
+                val pending = alerts.count { !it.hit }
+                Text(if (pending > 0) "가격알림 ($pending)" else "가격알림", fontSize = 13.sp)
             }
         }
 
@@ -601,11 +927,15 @@ fun JordanDashboard() {
                     Text("내 투자 현황", fontSize = 14.sp, color = Color.Gray)
                     Spacer(Modifier.height(4.dp))
                     for (h in holdings) {
-                        Text("${h.symbol}  ${num(h.qty)}주 · 평단 ${usd(h.avg)}", fontSize = 14.sp)
-                        if (h.ok) {
-                            Text("   현재 ${usd(h.cur)}", fontSize = 13.sp, color = Color.Gray)
+                        if (h.qty > 0.000001) {
+                            Text("${h.symbol}  ${num(h.qty)}주 · 평단 ${usd(h.avg)}", fontSize = 14.sp)
+                            if (h.ok) {
+                                Text("   현재 ${usd(h.cur)}", fontSize = 13.sp, color = Color.Gray)
+                            } else {
+                                Text("   시세 조회 안됨 — 종목코드를 확인하세요", fontSize = 12.sp, color = Color(0xFFE65100))
+                            }
                         } else {
-                            Text("   시세 조회 안됨 — 종목코드를 확인하세요", fontSize = 12.sp, color = UP_COLOR)
+                            Text("${h.symbol}  전량 매도 완료", fontSize = 14.sp, color = Color.Gray)
                         }
                     }
 
@@ -630,6 +960,17 @@ fun JordanDashboard() {
                             "${pct(profitWonPct)}   ${won(profitWon)}",
                             fontSize = 24.sp, fontWeight = FontWeight.Bold,
                             color = if (mainUp) UP_COLOR else DOWN_COLOR
+                        )
+                    }
+
+                    if (hasRealized) {
+                        Spacer(Modifier.height(10.dp))
+                        Text("실현 손익 (판 것)", fontSize = 11.sp, color = Color.Gray)
+                        Text(
+                            usd(totalRealized) +
+                                (if (usdKrw > 0.0) "   ${won(totalRealizedWon)}" else ""),
+                            fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                            color = if (totalRealized >= 0.0) UP_COLOR else DOWN_COLOR
                         )
                     }
 
